@@ -1,0 +1,40 @@
+name: 'GerbDiff - Visual Gerber Diff'
+description: 'Generates visual diff reports for Gerber PCB files on pull requests'
+author: 'Ben Woodruff'
+branding:
+  icon: 'layers'
+  color: 'blue'
+
+inputs:
+  token:
+    description: 'GitHub token for posting PR comments (defaults to GITHUB_TOKEN)'
+    required: false
+    default: ${{ github.token }}
+  gerber-extensions:
+    description: 'Comma-separated file extensions to treat as Gerber files'
+    required: false
+    default: 'gbr,gtl,gbl,gts,gbs,gto,gbo,gtp,gbp,gko,gm1,g2,g3,drl,xln,exc'
+  base-path:
+    description: 'Subdirectory containing Gerber files (relative to repo root)'
+    required: false
+    default: ''
+  diff-resolution:
+    description: 'XOR diff resolution in pixels (higher = more accurate, slower)'
+    required: false
+    default: '1000'
+  artifact-name:
+    description: 'Name for the uploaded diff artifact'
+    required: false
+    default: 'gerbdiff-report'
+
+outputs:
+  has-changes:
+    description: 'Whether any Gerber files had visual differences (true/false)'
+  changed-layers:
+    description: 'Number of layers with visual differences'
+  total-layers:
+    description: 'Total number of matched layers compared'
+
+runs:
+  using: 'node20'
+  main: 'dist/action/index.js'
