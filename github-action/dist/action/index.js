@@ -138568,7 +138568,10 @@ function listFilesAtRef(ref, dirPath, extensions) {
  * Read file content from a specific git ref.
  */
 function readFileAtRef(ref, filePath) {
-    return (0,external_child_process_.execSync)(`git show ${ref}:${filePath}`, { encoding: 'utf-8' });
+    return (0,external_child_process_.execSync)(`git show ${ref}:${filePath}`, {
+        encoding: 'utf-8',
+        maxBuffer: 256 * 1024 * 1024, // 256 MB — large Gerber files can exceed the 1 MB default
+    });
 }
 /**
  * Collect all Gerber files from a directory at a specific git ref.
@@ -138848,6 +138851,7 @@ var ApertureType;
     ApertureType["Obround"] = "obround";
     ApertureType["Polygon"] = "polygon";
     ApertureType["Macro"] = "macro";
+    ApertureType["Block"] = "block";
 })(ApertureType || (ApertureType = {}));
 // ---- Drawing State ----
 var ApertureState;
@@ -139656,6 +139660,8 @@ function createDefaultLayerState() {
     return {
         polarity: Polarity.Dark,
         rotation: 0,
+        mirror: MirrorState.None,
+        scale: 1,
         stepAndRepeat: { x: 1, y: 1, distX: 0, distY: 0 },
     };
 }
@@ -139730,6 +139736,7 @@ function parseGerber(content) {
     let pendingMacroName = null;
     let pendingMacroBody = [];
     let pendingMacroLine = 0;
+    const abStack = [];
     function finalizePendingMacro() {
         if (pendingMacroName !== null) {
             try {
@@ -139772,6 +139779,9 @@ function parseGerber(content) {
             layerIndex: state.currentLayerIndex,
             netStateIndex: state.currentNetStateIndex,
         };
+        if (currentObjectAttrs.size > 0) {
+            net.attributes = Object.fromEntries(currentObjectAttrs);
+        }
         // Calculate arc segment if circular interpolation
         if (state.apertureState === ApertureState.On &&
             (state.interpolation === Interpolation.ClockwiseCircular ||
@@ -139807,6 +139817,12 @@ function parseGerber(content) {
             case 'rectangle': return Math.max(ap.width, ap.height) / 2;
             case 'obround': return Math.max(ap.width, ap.height) / 2;
             case 'polygon': return ap.outerDiameter / 2;
+            case 'block': {
+                const bb = ap.boundingBox;
+                if (!isFinite(bb.maxX))
+                    return 0;
+                return Math.max(bb.maxX - bb.minX, bb.maxY - bb.minY) / 2;
+            }
             default: return 0;
         }
     }
@@ -139937,6 +139953,10 @@ function parseGerber(content) {
             case 'AD': {
                 const result = parseApertureDefinition(body, state.unit, macroDefinitions);
                 if (result) {
+                    if (pendingApertureAttrs.size > 0) {
+                        result.aperture.attributes = Object.fromEntries(pendingApertureAttrs);
+                        pendingApertureAttrs.clear();
+                    }
                     image.apertures.set(result.dCode, result.aperture);
                 }
                 else {
@@ -140089,6 +140109,44 @@ function parseGerber(content) {
                 }
                 break;
             }
+            case 'LM': {
+                // Layer mirroring (X3): N=none, X=flipX, Y=flipY, XY=flipBoth
+                const lmBody = body.slice(2);
+                const layer = { ...image.layers[state.currentLayerIndex] };
+                if (lmBody === 'XY')
+                    layer.mirror = MirrorState.FlipAB;
+                else if (lmBody === 'X')
+                    layer.mirror = MirrorState.FlipA;
+                else if (lmBody === 'Y')
+                    layer.mirror = MirrorState.FlipB;
+                else
+                    layer.mirror = MirrorState.None;
+                image.layers.push(layer);
+                state.currentLayerIndex = image.layers.length - 1;
+                break;
+            }
+            case 'LR': {
+                // Layer rotation (X3)
+                const lrDeg = parseFloat(body.slice(2));
+                if (!isNaN(lrDeg)) {
+                    const layer = { ...image.layers[state.currentLayerIndex] };
+                    layer.rotation = lrDeg * Math.PI / 180;
+                    image.layers.push(layer);
+                    state.currentLayerIndex = image.layers.length - 1;
+                }
+                break;
+            }
+            case 'LS': {
+                // Layer scaling (X3)
+                const lsVal = parseFloat(body.slice(2));
+                if (!isNaN(lsVal) && lsVal > 0) {
+                    const layer = { ...image.layers[state.currentLayerIndex] };
+                    layer.scale = lsVal;
+                    image.layers.push(layer);
+                    state.currentLayerIndex = image.layers.length - 1;
+                }
+                break;
+            }
             // X2/X3 attributes
             case 'TF': {
                 // File attribute: %TF.FileFunction,Copper,L1,Top*%
@@ -140148,6 +140206,79 @@ function parseGerber(content) {
                     const tdName = tdDot >= 0 ? tdBody.slice(tdDot + 1) : tdBody;
                     pendingApertureAttrs.delete(tdName);
                     currentObjectAttrs.delete(tdName);
+                }
+                break;
+            }
+            case 'AB': {
+                // Aperture block definition (X3)
+                const abBody = body.slice(2);
+                if (abBody.length > 0 && abBody.startsWith('D')) {
+                    // Open block: %ABD<code>*%
+                    const dCode = parseInt(abBody.slice(1), 10);
+                    if (isNaN(dCode) || dCode < 10) {
+                        diagnostics.push({
+                            severity: DiagnosticSeverity.Warning,
+                            message: `Invalid aperture block D-code: ${abBody}`,
+                            line: token.line,
+                        });
+                        break;
+                    }
+                    if (abStack.length >= 10) {
+                        diagnostics.push({
+                            severity: DiagnosticSeverity.Warning,
+                            message: `Aperture block nesting too deep (max 10)`,
+                            line: token.line,
+                        });
+                        break;
+                    }
+                    // Push current state onto stack
+                    abStack.push({
+                        nets: image.nets,
+                        layers: image.layers,
+                        currentLayerIndex: state.currentLayerIndex,
+                        boundingBox: image.boundingBox,
+                        apertures: image.apertures,
+                        dCode,
+                    });
+                    // Start capturing into fresh arrays
+                    image.nets = [];
+                    image.layers = [createDefaultLayerState()];
+                    state.currentLayerIndex = 0;
+                    image.boundingBox = { minX: Infinity, minY: Infinity, maxX: -Infinity, maxY: -Infinity };
+                    // Block shares the parent's aperture map so it can reference existing apertures
+                    image.apertures = new Map(image.apertures);
+                }
+                else {
+                    // Close block: %AB*%
+                    if (abStack.length === 0) {
+                        diagnostics.push({
+                            severity: DiagnosticSeverity.Warning,
+                            message: `Unexpected AB close without matching open`,
+                            line: token.line,
+                        });
+                        break;
+                    }
+                    const frame = abStack.pop();
+                    // Wrap captured nets as a BlockAperture
+                    const blockAperture = {
+                        type: ApertureType.Block,
+                        nets: image.nets,
+                        apertures: image.apertures,
+                        layers: image.layers,
+                        boundingBox: image.boundingBox,
+                    };
+                    // Restore parent state
+                    image.nets = frame.nets;
+                    image.layers = frame.layers;
+                    state.currentLayerIndex = frame.currentLayerIndex;
+                    image.boundingBox = frame.boundingBox;
+                    image.apertures = frame.apertures;
+                    // Register block aperture under the D-code
+                    if (pendingApertureAttrs.size > 0) {
+                        blockAperture.attributes = Object.fromEntries(pendingApertureAttrs);
+                        pendingApertureAttrs.clear();
+                    }
+                    image.apertures.set(frame.dCode, blockAperture);
                 }
                 break;
             }
@@ -140235,7 +140366,7 @@ function parseGerber(content) {
                     // Check if this token starts a new command (recognized prefix) or continues the macro body
                     const val = token.value;
                     const twoChar = val.slice(0, 2);
-                    const isNewCommand = ['FS', 'MO', 'AD', 'AM', 'LP', 'LN', 'LR', 'LS', 'SR', 'TF', 'TA', 'TO', 'TD', 'IP', 'IR', 'IN', 'IO', 'AS', 'MI', 'OF', 'SF'].includes(twoChar);
+                    const isNewCommand = ['FS', 'MO', 'AD', 'AM', 'LP', 'LN', 'LM', 'LR', 'LS', 'SR', 'TF', 'TA', 'TO', 'TD', 'IP', 'IR', 'IN', 'IO', 'AS', 'MI', 'OF', 'SF', 'AB'].includes(twoChar);
                     if (isNewCommand) {
                         finalizePendingMacro();
                         handleExtendedCommand(token.value, token);
@@ -140420,6 +140551,8 @@ function parseExcellon(content) {
             {
                 polarity: Polarity.Dark,
                 rotation: 0,
+                mirror: MirrorState.None,
+                scale: 1,
                 stepAndRepeat: { x: 1, y: 1, distX: 0, distY: 0 },
             },
         ],
@@ -141148,7 +141281,22 @@ function buildApertureTemplate(aperture) {
             return buildPolygonTemplate(aperture.outerDiameter, aperture.numVertices, aperture.rotation, aperture.holeDiameter);
         case ApertureType.Macro:
             return buildMacroTemplate(aperture);
+        case ApertureType.Block:
+            return buildBlockTemplate(aperture);
     }
+}
+function buildBlockTemplate(aperture) {
+    // Block apertures are unbatchable (can contain polarity changes)
+    const bb = aperture.boundingBox;
+    const extent = isFinite(bb.maxX) ? Math.max(bb.maxX - bb.minX, bb.maxY - bb.minY) : 0.001;
+    return {
+        fillPath: null,
+        holePath: null,
+        hasHole: false,
+        lineWidth: extent,
+        lineCap: 'round',
+        boundingRadius: extent / 2,
+    };
 }
 function buildCircleTemplate(diameter, holeDiameter) {
     const fillPath = new Path2D();
@@ -141527,6 +141675,12 @@ function compileImage(image) {
             if (!template)
                 continue;
             const aperture = image.apertures.get(net.apertureIndex);
+            // Block apertures: emit individually (contain full drawing sequences)
+            if (aperture?.type === ApertureType.Block) {
+                flushAll();
+                currentGroups.push({ kind: 'block-flash', x: net.stopX, y: net.stopY, apertureIndex: net.apertureIndex });
+                continue;
+            }
             // Macro with unbatchable primitives: emit individually
             if (aperture?.type === ApertureType.Macro && !template.macroBatchable) {
                 flushAll();
@@ -141617,7 +141771,7 @@ function compileImage(image) {
  * Render a CompiledImage to a canvas context. Drop-in replacement for
  * the inner loop of renderGerberToCanvas, producing identical output.
  */
-function renderCompiledToCanvas(ctx, image, compiled, viewport, options, renderMacroFlashFn) {
+function renderCompiledToCanvas(ctx, image, compiled, viewport, options, renderMacroFlashFn, renderBlockFlashFn) {
     const { width, height, panX, panY, zoom } = viewport;
     const drawColor = options?.drawColor ?? '#00ff88';
     const bgColor = options?.backgroundColor;
@@ -141655,19 +141809,39 @@ function renderCompiledToCanvas(ctx, image, compiled, viewport, options, renderM
         const srX = sr?.x ?? 1;
         const srY = sr?.y ?? 1;
         const hasSR = srX > 1 || srY > 1;
+        // Apply layer-level transforms (LM/LS/LR)
+        const imgLayer = image.layers[layer.layerIndex];
+        const hasMirror = imgLayer?.mirror && imgLayer.mirror !== MirrorState.None;
+        const hasScale = imgLayer?.scale !== undefined && imgLayer.scale !== 1;
+        const hasRotation = imgLayer?.rotation !== 0;
+        const hasLayerTransform = hasMirror || hasScale || hasRotation;
+        if (hasLayerTransform) {
+            ctx.save();
+            if (hasScale)
+                ctx.scale(imgLayer.scale, imgLayer.scale);
+            if (hasRotation)
+                ctx.rotate(imgLayer.rotation);
+            if (hasMirror) {
+                const sx = (imgLayer.mirror === MirrorState.FlipA || imgLayer.mirror === MirrorState.FlipAB) ? -1 : 1;
+                const sy = (imgLayer.mirror === MirrorState.FlipB || imgLayer.mirror === MirrorState.FlipAB) ? -1 : 1;
+                ctx.scale(sx, sy);
+            }
+        }
         for (let iy = 0; iy < srY; iy++) {
             for (let ix = 0; ix < srX; ix++) {
                 if (hasSR && (ix > 0 || iy > 0)) {
                     ctx.save();
                     ctx.translate(ix * sr.distX, iy * sr.distY);
                 }
-                // Skip culling for SR layers (translate offsets complicate bounds)
-                renderGroups(ctx, layer.groups, image, compiled.templates, renderMacroFlashFn, hasSR ? null : visibleBounds);
+                // Skip culling for SR/transformed layers (offsets complicate bounds)
+                renderGroups(ctx, layer.groups, image, compiled.templates, renderMacroFlashFn, renderBlockFlashFn, (hasSR || hasLayerTransform) ? null : visibleBounds);
                 if (hasSR && (ix > 0 || iy > 0)) {
                     ctx.restore();
                 }
             }
         }
+        if (hasLayerTransform)
+            ctx.restore();
     };
     // Standard painter's model (RS-274X spec): render all layers in file order.
     // Each compiled layer carries a polarity group that sets the composite operation
@@ -141690,7 +141864,7 @@ function renderCompiledToCanvas(ctx, image, compiled, viewport, options, renderM
         ctx.restore();
     }
 }
-function renderGroups(ctx, groups, image, templates, renderMacroFlashFn, visibleBounds) {
+function renderGroups(ctx, groups, image, templates, renderMacroFlashFn, renderBlockFlashFn, visibleBounds) {
     for (const group of groups) {
         // Viewport culling: skip groups entirely outside visible bounds
         if (visibleBounds && 'bbox' in group) {
@@ -141729,6 +141903,13 @@ function renderGroups(ctx, groups, image, templates, renderMacroFlashFn, visible
                 if (!aperture || !renderMacroFlashFn)
                     break;
                 renderMacroFlashFn(ctx, group.x, group.y, aperture);
+                break;
+            }
+            case 'block-flash': {
+                const blockAp = image.apertures.get(group.apertureIndex);
+                if (!blockAp || !renderBlockFlashFn)
+                    break;
+                renderBlockFlashFn(ctx, group.x, group.y, blockAp);
                 break;
             }
             case 'batched-draw':
@@ -141776,7 +141957,7 @@ function canvas_renderer_renderGerberToCanvas(ctx, image, viewport, options) {
     // Try pre-compiled Path2D rendering first (3-10x faster)
     try {
         const compiled = getCompiledImage(image);
-        renderCompiledToCanvas(ctx, image, compiled, viewport, options, renderMacroFlash);
+        renderCompiledToCanvas(ctx, image, compiled, viewport, options, renderMacroFlash, renderBlockFlash);
         return;
     }
     catch {
@@ -141860,12 +142041,33 @@ function canvas_renderer_renderGerberToCanvas(ctx, image, viewport, options) {
             }
         }
     };
+    const applyLayerTransform = (layer) => {
+        const hasMirror = layer.mirror && layer.mirror !== MirrorState.None;
+        const hasScale = layer.scale !== undefined && layer.scale !== 1;
+        const hasRotation = layer.rotation !== 0;
+        if (!hasMirror && !hasScale && !hasRotation)
+            return false;
+        ctx.save();
+        if (hasScale)
+            ctx.scale(layer.scale, layer.scale);
+        if (hasRotation)
+            ctx.rotate(layer.rotation);
+        if (hasMirror) {
+            const sx = (layer.mirror === MirrorState.FlipA || layer.mirror === MirrorState.FlipAB) ? -1 : 1;
+            const sy = (layer.mirror === MirrorState.FlipB || layer.mirror === MirrorState.FlipAB) ? -1 : 1;
+            ctx.scale(sx, sy);
+        }
+        return true;
+    };
     const renderSrBlock = (startIdx, endIdx, layerIdx) => {
         const layer = image.layers[layerIdx];
         const sr = layer?.stepAndRepeat;
+        const hasTransform = layer ? applyLayerTransform(layer) : false;
         if (!sr || (sr.x <= 1 && sr.y <= 1)) {
             // No step-and-repeat: render normally
             renderNetsRange(startIdx, endIdx);
+            if (hasTransform)
+                ctx.restore();
             return;
         }
         // Step-and-repeat: render the block at each grid position
@@ -141887,6 +142089,8 @@ function canvas_renderer_renderGerberToCanvas(ctx, image, viewport, options) {
                 }
             }
         }
+        if (hasTransform)
+            ctx.restore();
     };
     // Process nets, grouping by SR blocks
     for (let i = 0; i < image.nets.length; i++) {
@@ -141961,6 +142165,12 @@ function renderDraw(ctx, net, aperture) {
             lineWidth = macroBoundingDiameter(aperture.definition, aperture.params) * aperture.unitScale;
             ctx.lineCap = 'round';
             break;
+        case ApertureType.Block: {
+            const bb = aperture.boundingBox;
+            lineWidth = isFinite(bb.maxX) ? Math.max(bb.maxX - bb.minX, bb.maxY - bb.minY) : 0.001;
+            ctx.lineCap = 'round';
+            break;
+        }
         default:
             lineWidth = 0.001;
             ctx.lineCap = 'round';
@@ -142067,6 +142277,10 @@ function renderFlash(ctx, net, aperture) {
         }
         case ApertureType.Macro: {
             renderMacroFlash(ctx, x, y, aperture);
+            break;
+        }
+        case ApertureType.Block: {
+            renderBlockFlash(ctx, x, y, aperture);
             break;
         }
     }
@@ -142234,6 +142448,44 @@ function renderMacroPrimitive(ctx, flashX, flashY, prim, savedOp) {
             break;
         }
     }
+}
+function renderBlockFlash(ctx, flashX, flashY, aperture) {
+    ctx.save();
+    ctx.translate(flashX, flashY);
+    const savedOp = ctx.globalCompositeOperation;
+    let inRegion = false;
+    for (const net of aperture.nets) {
+        const layer = aperture.layers[net.layerIndex];
+        ctx.globalCompositeOperation =
+            layer?.polarity === Polarity.Clear ? 'destination-out' : savedOp;
+        if (net.interpolation === Interpolation.RegionStart) {
+            inRegion = true;
+            ctx.beginPath();
+            ctx.moveTo(net.stopX, net.stopY);
+            continue;
+        }
+        if (net.interpolation === Interpolation.RegionEnd) {
+            inRegion = false;
+            ctx.closePath();
+            ctx.fill('evenodd');
+            continue;
+        }
+        if (inRegion) {
+            renderRegionSegment(ctx, net);
+            continue;
+        }
+        const ap = aperture.apertures.get(net.apertureIndex);
+        switch (net.apertureState) {
+            case ApertureState.On:
+                renderDraw(ctx, net, ap);
+                break;
+            case ApertureState.Flash:
+                renderFlash(ctx, net, ap);
+                break;
+        }
+    }
+    ctx.globalCompositeOperation = savedOp;
+    ctx.restore();
 }
 // ---- Bitmap Render Cache (REMOVED) ----
 // The bitmap cache was removed because the compiled-path renderer (path-cache.ts)
