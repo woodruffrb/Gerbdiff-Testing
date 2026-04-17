@@ -1,0 +1,27 @@
+name: GerbDiff Visual Review
+
+on:
+  pull_request:
+    paths:
+      - 'gerbers/**'
+
+jobs:
+  gerbdiff:
+    name: Visual Gerber Diff
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: write
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Run GerbDiff
+        uses: woodruffrb/gerbdiff/github-action@v2.5.0
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          base-path: gerbers
+          diff-resolution: 1200
